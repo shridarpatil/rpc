@@ -114,6 +114,19 @@ func (c *CodecRequest) ReadRequest(args interface{}) error {
 	return c.err
 }
 
+func (c *CodecRequest) WriteError(w http.ResponseWriter, _ int, err error) {
+	res := &serverResponse{
+		Result: &null,
+		// Id:     c.request.Id,
+	}
+	if jsonErr, ok := err.(*Error); ok {
+		res.Error = jsonErr.Data
+	} else {
+		res.Error = err.Error()
+	}
+	c.writeServerResponse(w, 400, res)
+}
+
 // WriteResponse encodes the response and writes it to the ResponseWriter.
 //
 // The err parameter is the error resulted from calling the RPC method,
@@ -125,7 +138,7 @@ func (c *CodecRequest) WriteResponse(w http.ResponseWriter, reply interface{}, m
 	res := &serverResponse{
 		Result: reply,
 		Error:  &null,
-		Id:     c.request.Id,
+		// Id:     c.request.Id,
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if methodErr != nil {
