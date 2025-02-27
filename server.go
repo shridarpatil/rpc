@@ -43,8 +43,9 @@ type CodecRequest interface {
 // NewServer returns a new RPC server.
 func NewServer() *Server {
 	return &Server{
-		codecs:   make(map[string]Codec),
-		services: new(serviceMap),
+		codecs:        make(map[string]Codec),
+		services:      new(serviceMap),
+		allowedMethods: []string{"POST"},
 	}
 }
 
@@ -58,12 +59,13 @@ type RequestInfo struct {
 
 // Server serves registered RPC services using registered codecs.
 type Server struct {
-	codecs        map[string]Codec
-	services      *serviceMap
-	interceptFunc func(i *RequestInfo) *http.Request
-	beforeFunc    func(i *RequestInfo)
-	afterFunc     func(i *RequestInfo)
-	validateFunc  reflect.Value
+	codecs         map[string]Codec
+	services       *serviceMap
+	interceptFunc  func(i *RequestInfo) *http.Request
+	beforeFunc     func(i *RequestInfo)
+	afterFunc      func(i *RequestInfo)
+	validateFunc   reflect.Value
+	allowedMethods []string
 }
 
 // RegisterCodec adds a new codec to the server.
@@ -113,6 +115,11 @@ func (s *Server) RegisterAfterFunc(f func(i *RequestInfo)) {
 	s.afterFunc = f
 }
 
+// EnableGET enables GET HTTP method for RPC calls
+func (s *Server) EnableGET() {
+	s.allowedMethods = append(s.allowedMethods, "GET")
+}
+
 // RegisterService adds a new service to the server.
 //
 // The name parameter is optional: if empty it will be inferred from
@@ -145,26 +152,61 @@ func (s *Server) HasMethod(method string) bool {
 
 // ServeHTTP
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		WriteError(w, http.StatusMethodNotAllowed, "rpc: POST method required, received "+r.Method)
-		return
-	}
-	contentType := r.Header.Get("Content-Type")
-	idx := strings.Index(contentType, ";")
-	if idx != -1 {
-		contentType = contentType[:idx]
-	}
-	var codec Codec
-	if contentType == "" && len(s.codecs) == 1 {
-		// If Content-Type is not set and only one codec has been registered,
-		// then default to that codec.
-		for _, c := range s.codecs {
-			codec = c
+	// Check if the HTTP method is allowed
+	methodAllowed := false
+	for _, m := range s.allowedMethods {
+		if r.Method == m {
+			methodAllowed = true
+			break
 		}
-	} else if codec = s.codecs[strings.ToLower(contentType)]; codec == nil {
-		WriteError(w, http.StatusUnsupportedMediaType, "rpc: unrecognized Content-Type: "+contentType)
+	}
+
+	if !methodAllowed {
+		WriteError(w, http.StatusMethodNotAllowed, 
+			fmt.Sprintf("rpc: only %s methods are allowed, received %s", 
+				strings.Join(s.allowedMethods, ","), r.Method))
 		return
 	}
+
+	// For GET requests, we don't enforce the Content-Type header
+	var codec Codec
+	if r.Method == "GET" {
+		// If only one codec has been registered, use that
+		if len(s.codecs) == 1 {
+			for _, c := range s.codecs {
+				codec = c
+			}
+		} else {
+			// Try to find a codec that supports GET, preferably application/json
+			if jsonCodec, ok := s.codecs["application/json"]; ok {
+				codec = jsonCodec
+			} else {
+				// Pick the first codec
+				for _, c := range s.codecs {
+					codec = c
+					break
+				}
+			}
+		}
+	} else {
+		// For non-GET requests, use Content-Type based selection
+		contentType := r.Header.Get("Content-Type")
+		idx := strings.Index(contentType, ";")
+		if idx != -1 {
+			contentType = contentType[:idx]
+		}
+		if contentType == "" && len(s.codecs) == 1 {
+			// If Content-Type is not set and only one codec has been registered,
+			// then default to that codec.
+			for _, c := range s.codecs {
+				codec = c
+			}
+		} else if codec = s.codecs[strings.ToLower(contentType)]; codec == nil {
+			WriteError(w, http.StatusUnsupportedMediaType, "rpc: unrecognized Content-Type: "+contentType)
+			return
+		}
+	}
+
 	// Create a new codec request.
 	codecReq := codec.NewRequest(r)
 	// Get service method to be called.
@@ -174,7 +216,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serviceSpec, methodSpec, errGet := s.services.get(method)
-	fmt.Println("%v, %v", serviceSpec, methodSpec)
 	if errGet != nil {
 		codecReq.WriteError(w, http.StatusBadRequest, errGet)
 		return
