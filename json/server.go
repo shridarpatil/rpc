@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/shridarpatil/rpc"
 )
@@ -69,6 +71,9 @@ type Codec struct {
 
 // NewRequest returns a CodecRequest.
 func (c *Codec) NewRequest(r *http.Request) rpc.CodecRequest {
+	if r.Method == "GET" {
+		return newGetCodecRequest(r)
+	}
 	return newCodecRequest(r)
 }
 
@@ -76,13 +81,77 @@ func (c *Codec) NewRequest(r *http.Request) rpc.CodecRequest {
 // CodecRequest
 // ----------------------------------------------------------------------------
 
-// newCodecRequest returns a new CodecRequest.
+// newCodecRequest returns a new CodecRequest for POST requests.
 func newCodecRequest(r *http.Request) rpc.CodecRequest {
 	// Decode the request body and check if RPC method is valid.
 	req := new(serverRequest)
 	err := json.NewDecoder(r.Body).Decode(req)
 	r.Body.Close()
 	return &CodecRequest{request: req, err: err}
+}
+
+// newGetCodecRequest returns a new CodecRequest for GET requests.
+func newGetCodecRequest(r *http.Request) rpc.CodecRequest {
+	// Parse the URL query parameters
+	err := r.ParseForm()
+	if err != nil {
+		return &CodecRequest{request: nil, err: err}
+	}
+
+	// Extract method from URL path or query parameter
+	method := ""
+	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(pathParts) > 0 && pathParts[len(pathParts)-1] != "" {
+		// Use the last part of the path as the method name
+		method = pathParts[len(pathParts)-1]
+	} else if methodParam := r.Form.Get("method"); methodParam != "" {
+		// Fall back to query parameter
+		method = methodParam
+	}
+
+	if method == "" {
+		return &CodecRequest{request: nil, err: errors.New("rpc: method name missing")}
+	}
+
+	// Convert query parameters to JSON params
+	paramsJSON, err := convertURLParamsToJSON(r.Form)
+	if err != nil {
+		return &CodecRequest{request: nil, err: err}
+	}
+
+	req := &serverRequest{
+		Method: method,
+		Params: &paramsJSON,
+	}
+
+	return &CodecRequest{request: req, err: nil}
+}
+
+// convertURLParamsToJSON converts URL query parameters to a JSON-RPC params structure
+func convertURLParamsToJSON(form url.Values) (json.RawMessage, error) {
+	// Remove method parameter if it exists as it's already handled
+	delete(form, "method")
+	
+	// Create a map from the query parameters
+	paramsMap := make(map[string]interface{})
+	for key, values := range form {
+		if len(values) == 1 {
+			paramsMap[key] = values[0]
+		} else if len(values) > 1 {
+			paramsMap[key] = values
+		}
+	}
+
+	// Wrap the map in an array to match JSON-RPC param format
+	paramsArray := []interface{}{paramsMap}
+	
+	// Marshal to JSON
+	jsonData, err := json.Marshal(paramsArray)
+	if err != nil {
+		return nil, err
+	}
+	
+	return json.RawMessage(jsonData), nil
 }
 
 // CodecRequest decodes and encodes a single request.
