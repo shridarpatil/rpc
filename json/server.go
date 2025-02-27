@@ -71,45 +71,95 @@ type Codec struct {
 
 // NewRequest returns a CodecRequest.
 func (c *Codec) NewRequest(r *http.Request) rpc.CodecRequest {
-	if r.Method == "GET" {
-		return newGetCodecRequest(r)
+	// Parse URL parameters for all requests to extract method if present
+	err := r.ParseForm()
+	if err != nil {
+		return &CodecRequest{request: nil, err: err}
 	}
-	return newCodecRequest(r)
+
+	// Check for method in URL path or query parameters
+	methodFromURL := extractMethodFromURL(r)
+
+	if r.Method == "GET" {
+		return newGetCodecRequest(r, methodFromURL)
+	}
+
+	return newPostCodecRequest(r, methodFromURL)
+}
+
+// extractMethodFromURL extracts method name from either URL path or query parameters
+func extractMethodFromURL(r *http.Request) string {
+	var methodName string
+
+	// First check if method is in path like /rpc/<method>
+	if strings.HasPrefix(r.URL.Path, "/rpc/") {
+		methodPath := strings.TrimPrefix(r.URL.Path, "/rpc/")
+		if methodPath != "" {
+			methodName = methodPath
+		}
+	}
+
+	// If not found, check last part of any path
+	if methodName == "" {
+		pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(pathParts) > 0 && pathParts[len(pathParts)-1] != "" {
+			// Use the last part of the path as the method name
+			methodName = pathParts[len(pathParts)-1]
+		}
+	}
+
+	// If still not found, check query parameter
+	if methodName == "" {
+		if methodParam := r.Form.Get("method"); methodParam != "" {
+			methodName = methodParam
+		}
+	}
+
+	// Format the method name properly - first character of service and method should be uppercase
+	if methodName != "" {
+		parts := strings.Split(methodName, ".")
+		if len(parts) == 2 {
+			// Properly capitalize the service name and method name
+			service := strings.ToUpper(parts[0][:1]) + parts[0][1:]
+			method := strings.ToUpper(parts[1][:1]) + parts[1][1:]
+			methodName = service + "." + method
+		}
+	}
+
+	return methodName
 }
 
 // ----------------------------------------------------------------------------
 // CodecRequest
 // ----------------------------------------------------------------------------
 
-// newCodecRequest returns a new CodecRequest for POST requests.
-func newCodecRequest(r *http.Request) rpc.CodecRequest {
-	// Decode the request body and check if RPC method is valid.
+// newPostCodecRequest returns a new CodecRequest for POST requests.
+func newPostCodecRequest(r *http.Request, methodFromURL string) rpc.CodecRequest {
+	// Decode the request body
 	req := new(serverRequest)
 	err := json.NewDecoder(r.Body).Decode(req)
 	r.Body.Close()
+
+	// If method is specified in URL and not in the JSON body, use the URL method
+	if err == nil && methodFromURL != "" && req.Method == "" {
+		req.Method = methodFromURL
+	}
+
+	// If there's an error with the JSON body but we have a method from URL,
+	// create a new request with just that method
+	if err != nil && methodFromURL != "" {
+		req = &serverRequest{
+			Method: methodFromURL,
+		}
+		err = nil
+	}
+
 	return &CodecRequest{request: req, err: err}
 }
 
 // newGetCodecRequest returns a new CodecRequest for GET requests.
-func newGetCodecRequest(r *http.Request) rpc.CodecRequest {
-	// Parse the URL query parameters
-	err := r.ParseForm()
-	if err != nil {
-		return &CodecRequest{request: nil, err: err}
-	}
-
-	// Extract method from URL path or query parameter
-	method := ""
-	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(pathParts) > 0 && pathParts[len(pathParts)-1] != "" {
-		// Use the last part of the path as the method name
-		method = pathParts[len(pathParts)-1]
-	} else if methodParam := r.Form.Get("method"); methodParam != "" {
-		// Fall back to query parameter
-		method = methodParam
-	}
-
-	if method == "" {
+func newGetCodecRequest(r *http.Request, methodFromURL string) rpc.CodecRequest {
+	if methodFromURL == "" {
 		return &CodecRequest{request: nil, err: errors.New("rpc: method name missing")}
 	}
 
@@ -120,7 +170,7 @@ func newGetCodecRequest(r *http.Request) rpc.CodecRequest {
 	}
 
 	req := &serverRequest{
-		Method: method,
+		Method: methodFromURL,
 		Params: &paramsJSON,
 	}
 
@@ -131,7 +181,6 @@ func newGetCodecRequest(r *http.Request) rpc.CodecRequest {
 func convertURLParamsToJSON(form url.Values) (json.RawMessage, error) {
 	// Remove method parameter if it exists as it's already handled
 	delete(form, "method")
-	
 	// Create a map from the query parameters
 	paramsMap := make(map[string]interface{})
 	for key, values := range form {
@@ -141,16 +190,11 @@ func convertURLParamsToJSON(form url.Values) (json.RawMessage, error) {
 			paramsMap[key] = values
 		}
 	}
-
-	// Wrap the map in an array to match JSON-RPC param format
-	paramsArray := []interface{}{paramsMap}
-	
-	// Marshal to JSON
-	jsonData, err := json.Marshal(paramsArray)
+	// Marshal the map directly - don't wrap in an array
+	jsonData, err := json.Marshal(paramsMap)
 	if err != nil {
 		return nil, err
 	}
-	
 	return json.RawMessage(jsonData), nil
 }
 
@@ -174,12 +218,15 @@ func (c *CodecRequest) Method() (string, error) {
 func (c *CodecRequest) ReadRequest(args interface{}) error {
 	if c.err == nil {
 		if c.request.Params != nil {
-			// JSON params is array value. RPC params is struct.
-			// Unmarshal into array containing the request struct.
-			params := [1]interface{}{args}
-			c.err = json.Unmarshal(*c.request.Params, &params)
+			// Directly unmarshal params into the args struct
+			c.err = json.Unmarshal(*c.request.Params, args)
 		} else {
-			c.err = errors.New("rpc: method request ill-formed: missing params field")
+			// For POST requests with empty body but method in URL,
+			// create empty params if needed
+			emptyParams := []byte("{}")
+			rawMessage := json.RawMessage(emptyParams)
+			c.request.Params = &rawMessage
+			c.err = json.Unmarshal(*c.request.Params, args)
 		}
 	}
 	return c.err
